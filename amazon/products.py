@@ -8,6 +8,14 @@ session); the others get an empty reviews medley, and every review ajax
 route is login-gated. `_page_with_reviews` therefore drops the thread's
 session and re-fetches until a page carries reviews (bounded by
 REVIEW_ATTEMPTS), remembering sessions that never will.
+
+Hollow pages: Amazon sometimes answers a product URL with HTTP 200 and the
+storefront shell only — the product name in <title>, an empty
+#dp-container, no #productTitle (measured on amazon.in 2026-11-13: about
+1 in 3 fresh sessions for a listed ASIN). A product that does not exist is
+a real HTTP 404, raised as AmazonNotFound by the fetch layer, so a 200
+page the parser finds no title in is a block (retry later), never "not
+found". A re-fetch for reviews never trades a full page for a hollow one.
 """
 from amazon import fetch, parsers as P, refs, sites
 from amazon.shared import context, fan_out, paged_result
@@ -21,26 +29,39 @@ CONDITIONS = {"all": None, "new": "new", "used": "usedAcceptable", "used_like_ne
               "collectible": "collectible"}
 
 
+def _has_product(html):
+    return 'id="productTitle"' in html or 'id="title"' in html
+
+
 def _product_page(asin, site, locale, postal_code=None, want_reviews=False, attempts=1):
     """The dp page HTML, re-fetched on a fresh session while it lacks
-    inline reviews (when wanted)."""
+    inline reviews (when wanted). A hollow page rotates the session too; a
+    hollow re-fetch keeps the page before it."""
     html = None
     for attempt in range(max(attempts, 1)):
-        html = fetch.page(site["country"], f"/dp/{asin}", {"th": "1", "psc": "1"}, referer=f"{site['base']}/s?k={asin}",
-                          postal_code=postal_code, language=locale, label=f"product {asin}")
+        fetched = fetch.page(site["country"], f"/dp/{asin}", {"th": "1", "psc": "1"}, referer=f"{site['base']}/s?k={asin}",
+                             postal_code=postal_code, language=locale, label=f"product {asin}")
+        if html is None or _has_product(fetched) or not _has_product(html):
+            html = fetched
         if not want_reviews or 'data-hook="review"' in html:
             break
-        if P.review_treatment(html) == "T1" and attempt < attempts - 1:
+        if (P.review_treatment(html) == "T1" or not _has_product(html)) and attempt < attempts - 1:
             fetch.drop_session(site["country"], "page", locale)
     return html
+
+
+def _product_data(asin, html, site):
+    """Parsed product page; a page without a product title is a block."""
+    data = P.product_page(html, site)
+    if not data.get("title"):
+        raise fetch.AmazonBlocked(f"product {asin}: Amazon served a page without the product (blocked), retry later")
+    return data
 
 
 def details(product, country=None, language=None, postal_code=None):
     site, locale = context(country, language)
     html = _product_page(product, site, locale, postal_code, want_reviews=True, attempts=REVIEW_ATTEMPTS_DETAILS)
-    data = P.product_page(html, site)
-    if not data.get("title"):
-        raise fetch.AmazonNotFound(f"product {product}: no product page (unavailable or removed)")
+    data = _product_data(product, html, site)
     data["asin"] = data.get("asin") or product
     data["link"] = P.product_link(site, data["asin"])
     return data
@@ -81,9 +102,7 @@ def offers(product, country=None, language=None, page=1, condition="all", prime_
 def variations(product, country=None, language=None):
     site, locale = context(country, language)
     html = _product_page(product, site, locale)
-    data = P.product_page(html, site)
-    if not data.get("title"):
-        raise fetch.AmazonNotFound(f"product {product}: no product page")
+    data = _product_data(product, html, site)
     block = data.get("variations") or {"parent_asin": None, "current_asin": data.get("asin"), "dimensions": [], "products": [], "count": 0}
     return {"asin": data.get("asin") or product, "title": data.get("title"), "link": data.get("link"), **block,
             "country": site["country"], "domain": site["host"]}
@@ -92,9 +111,7 @@ def variations(product, country=None, language=None):
 def reviews(product, country=None, language=None):
     site, locale = context(country, language)
     html = _product_page(product, site, locale, want_reviews=True, attempts=REVIEW_ATTEMPTS_REVIEWS)
-    data = P.product_page(html, site)
-    if not data.get("title"):
-        raise fetch.AmazonNotFound(f"product {product}: no product page")
+    data = _product_data(product, html, site)
     rows = data.get("top_reviews") or []
     return {
         "asin": data.get("asin") or product,
@@ -130,9 +147,7 @@ def bulk(products, country=None, language=None, postal_code=None):
 
     def one(asin):
         html = _product_page(asin, site, locale, postal_code)
-        data = P.product_page(html, site)
-        if not data.get("title"):
-            raise fetch.AmazonNotFound("no product page")
+        data = _product_data(asin, html, site)
         data["asin"] = data.get("asin") or asin
         data["link"] = P.product_link(site, data["asin"])
         return _summary(data)
