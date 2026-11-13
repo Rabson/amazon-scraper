@@ -8,6 +8,14 @@ session); the others get an empty reviews medley, and every review ajax
 route is login-gated. `_page_with_reviews` therefore drops the thread's
 session and re-fetches until a page carries reviews (bounded by
 REVIEW_ATTEMPTS), remembering sessions that never will.
+
+Hollow pages: Amazon sometimes answers a product URL with HTTP 200 and the
+storefront shell only — the product name in <title>, an empty
+#dp-container, no #productTitle (measured on amazon.in 2026-11-13: about
+1 in 3 fresh sessions for a listed ASIN). A product that does not exist is
+a real HTTP 404, raised as AmazonNotFound by the fetch layer, so a 200
+page the parser finds no title in is a block (retry later), never "not
+found". A re-fetch for reviews never trades a full page for a hollow one.
 """
 from amazon import fetch, parsers as P, refs, sites
 from amazon.shared import context, fan_out, paged_result
@@ -21,49 +29,52 @@ CONDITIONS = {"all": None, "new": "new", "used": "usedAcceptable", "used_like_ne
               "collectible": "collectible"}
 
 
+def _has_product(html):
+    return 'id="productTitle"' in html or 'id="title"' in html
+
+
 def _product_page(asin, site, locale, postal_code=None, want_reviews=False, attempts=1):
     """The dp page HTML, re-fetched on a fresh session while it lacks
-    inline reviews (when wanted)."""
+    inline reviews (when wanted). A hollow page rotates the session too; a
+    hollow re-fetch keeps the page before it."""
     html = None
     for attempt in range(max(attempts, 1)):
-        html = fetch.page(site["country"], f"/dp/{asin}", {"th": "1", "psc": "1"}, referer=f"{site['base']}/s?k={asin}",
-                          postal_code=postal_code, language=locale, label=f"product {asin}")
+        fetched = fetch.page(site["country"], f"/dp/{asin}", {"th": "1", "psc": "1"}, referer=f"{site['base']}/s?k={asin}",
+                             postal_code=postal_code, language=locale, label=f"product {asin}")
+        if html is None or _has_product(fetched) or not _has_product(html):
+            html = fetched
         if not want_reviews or 'data-hook="review"' in html:
             break
-        if P.review_treatment(html) == "T1" and attempt < attempts - 1:
+        if (P.review_treatment(html) == "T1" or not _has_product(html)) and attempt < attempts - 1:
             fetch.drop_session(site["country"], "page", locale)
     return html
 
 
-def _looks_like_storefront(html):
-    """A full storefront page (nav bar + a real body) as opposed to a
-    challenge / interstitial / stub that slipped past the block checks."""
-    return len(html or "") > 100_000 and ('id="navbar' in html or 'id="nav-logo' in html)
 
 
-NO_TITLE_RETRIES = 2            # fresh sessions spent on a page that is neither a product nor a storefront page
+NO_TITLE_RETRIES = 2            # fresh sessions spent on a page without the product
 
 
 def _product_data(product, site, locale, postal_code=None, want_reviews=False, attempts=1):
-    """(html, parsed) of a product page. A page without a title that is not
-    a full storefront page either is a block the fetch layer did not
-    recognise (interstitial, challenge stub): it is retried on a fresh
-    session and finally raised as AmazonBlocked, never as a missing product
-    — a removed ASIN is Amazon's own HTTP 404 (fetch raises AmazonNotFound),
-    and a full page without a product title is the only "no product page"."""
+    """(html, parsed) of a product page. A page without the product's title
+    (an interstitial, a challenge stub, or Amazon's throttling "hollow" page,
+    which still has the nav bar) is retried on a fresh session and finally
+    raised as AmazonBlocked, never as a missing product: a removed ASIN is
+    Amazon's own HTTP 404, which fetch raises as AmazonNotFound."""
     html = _product_page(product, site, locale, postal_code, want_reviews=want_reviews, attempts=attempts)
     data = P.product_page(html, site)
     for _ in range(NO_TITLE_RETRIES):
-        if data.get("title") or _looks_like_storefront(html):
+        if data.get("title"):
             break
         fetch.dump_debug(f"no_title_{product}", html)
         fetch.drop_session(site["country"], "page", locale)
         html = _product_page(product, site, locale, postal_code, want_reviews=want_reviews, attempts=attempts)
         data = P.product_page(html, site)
     if not data.get("title"):
-        if not _looks_like_storefront(html):
-            raise fetch.AmazonBlocked(f"product {product}: Amazon answered a bot-check page instead of the product (retry)")
-        raise fetch.AmazonNotFound(f"product {product}: no product page (unavailable or removed)")
+        # A removed ASIN is Amazon's own HTTP 404 (fetch raises AmazonNotFound before this). A
+        # page without the product is a block even when it looks like a full storefront page:
+        # Amazon throttles with a "hollow" product page (nav bar, title only in <title>).
+        raise fetch.AmazonBlocked(f"product {product}: Amazon served a page without the product (blocked), retry later")
     return html, data
 
 
